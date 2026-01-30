@@ -1,0 +1,102 @@
+import pandas as pd
+import requests
+import json
+import re
+import unicodedata
+import pytz
+import io
+import gc
+import time
+import os
+from datetime import datetime, timedelta
+from google.cloud import storage
+from google.cloud import bigquery
+from extract import fetch_deals_from_bitrix
+from preprocessing import extract_last_10_digits,get_bitrix_maps,normalize_lists,process_source,get_best_phone,convert_to_strict_date,fill_date_fallback,run_bigquery_merge,fix_date_format
+
+# --- BITRIX CONFIG ---
+BITRIX_WEBHOOK = "https://diet-hub.bitrix24.com/rest/625003/f2ijr5q7sa4w5z6g/"
+
+
+# --- CONFIGURATION CODE 2 ---
+PROJECT_ID = "data-analysis-450711"
+DATASET_ID = "Crm_Diethub"
+TABLE_ID = "Crm_Calls"
+METHOD = "voximplant.statistic.get"
+
+
+def main_pipeline():
+    
+#  Determine Date & Fetch
+    df = fetch_deals_from_bitrix()
+    
+    if df.empty:
+        print("No deals found for this period.")
+        return
+
+    # 2. Get Maps
+    maps = get_bitrix_maps()
+
+    
+    USER_COLUMNS = {
+    "PORTAL_USER_ID"
+    }
+    PORTAL_NUMBER_sip = {"PORTAL_NUMBER"}
+    Phone_number_column = {"PHONE_NUMBER"}
+    Call_type_column = {"CALL_TYPE"}
+    Date_columns = {"CALL_START_DATE"}
+
+
+
+    # 3. Apply Mappings
+    print(" Mapping Values...")
+    if "PORTAL_USER_ID" in df.columns:
+        df["PORTAL_USER_ID_NAME"] = df["PORTAL_USER_ID"].astype(str).map(maps['portal_user']).fillna(df["PORTAL_USER_ID"])
+        
+    if "PORTAL_NUMBER" in df.columns:
+        df["PORTAL_NUMBER_NAME"] = df["PORTAL_NUMBER"].astype(str).map(maps['portal_name']).fillna(df["PORTAL_NUMBER"])
+
+    if "CALL_TYPE" in df.columns:
+        df["CALL_TYPE_NAME"] = df["CALL_TYPE"].astype(str).map(maps['call_type']).fillna("Unknown")
+
+    # 4. Clean Lists
+    print(" Fixing Lists...")
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = df[col].apply(normalize_lists)
+
+    # 5. Clean Phone Number
+    print(" Cleaning Data...")
+    if "PHONE_NUMBER" in df.columns:
+        df['clean_phone_10_digits'] = df['PHONE_NUMBER'].apply(extract_last_10_digits)
+
+    # 6. Process Dates
+    print(" Processing Dates...")
+    # Defined explicitly here
+    date_columns_to_fix = ["CALL_START_DATE", "CALL_FAILED_DATE"] 
+    
+    for col in df.columns:
+        if col in date_columns_to_fix:
+            df[col] = df[col].apply(fix_date_format)
+            print(f"   > Fixed Date Format: {col}")
+
+    
+    client = bigquery.Client(project=PROJECT_ID)
+    table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+    
+    job_config = bigquery.LoadJobConfig(
+        write_disposition="WRITE_APPEND",
+        source_format=bigquery.SourceFormat.PARQUET 
+    )
+
+    try:
+        job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+        job.result()
+        print("Pipeline Success!")
+    except Exception as e:
+        print(f" Upload Failed: {e}")
+
+if __name__ == "__main__":
+    main_pipeline()
+
+
